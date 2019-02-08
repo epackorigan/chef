@@ -29,7 +29,7 @@ class Chef
     class Base
 
       # Called at the very start of a Chef Run
-      def run_start(version)
+      def run_start(version, run_status)
       end
 
       def run_started(run_status)
@@ -44,6 +44,7 @@ class Chef
       end
 
       # Called right after ohai runs.
+      # NOTE: the node object here is always nil because of when it is called
       def ohai_completed(node)
       end
 
@@ -72,6 +73,10 @@ class Chef
       end
 
       # TODO: def node_run_list_overridden(*args)
+
+      # Called once the node is loaded by the policy builder
+      def node_load_success(node)
+      end
 
       # Failed to load node data from the server
       def node_load_failed(node_name, exception, config)

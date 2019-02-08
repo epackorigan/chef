@@ -3,7 +3,7 @@
 # Author:: Christopher Walters (<cw@chef.io>)
 # Author:: Christopher Brown (<cb@chef.io>)
 # Author:: Tim Hinderliter (<tim@chef.io>)
-# Copyright:: Copyright 2008-2018, Chef Software Inc.
+# Copyright:: Copyright 2008-2019, Chef Software Inc.
 # License:: Apache License, Version 2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -250,9 +250,13 @@ class Chef
       begin
         runlock.save_pid
 
+        events.register(Chef::DataCollector::Reporter.new(events))
+        events.register(Chef::ActionCollection.new(events))
+
         request_id = Chef::RequestID.instance.request_id
         run_context = nil
-        events.run_start(Chef::VERSION)
+        events.run_start(Chef::VERSION, run_status)
+
         logger.info("*** Chef #{Chef::VERSION} ***")
         logger.info("Platform: #{RUBY_PLATFORM}")
         logger.info "Chef-client pid: #{Process.pid}"
@@ -414,9 +418,7 @@ class Chef
     # @api private
     def register_reporters
       [
-        Chef::ActionCollection.new,
         Chef::ResourceReporter.new(rest_clean),
-        Chef::DataCollector::Reporter.new(events),
         Chef::Audit::AuditReporter.new(rest_clean),
       ].each do |r|
         events.register(r)

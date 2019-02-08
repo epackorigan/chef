@@ -32,19 +32,20 @@ class Chef
         #
         # @return [Hash] A hash containing the run start message data.
         #
-        def run_start_message(data_collector)
+        def construct_message(data_collector)
           run_status = data_collector.run_status
+          node = data_collector.node
           {
             "chef_server_fqdn" => chef_server_fqdn,
-            "entity_uuid" => Chef::DataCollector::NodeUUID.node_uuid(run_status.run_context.node),
-            "id" => run_status.run_id,
+            "entity_uuid" => Chef::DataCollector::NodeUUID.node_uuid(node),
+            "id" => run_status&.run_id,
             "message_version" => "1.0.0",
             "message_type" => "run_start",
-            "node_name" => run_status.node.name,
+            "node_name" => node&.name,
             "organization_name" => organization,
-            "run_id" => run_status.run_id,
+            "run_id" => run_status&.run_id,
             "source" => collector_source,
-            "start_time" => run_status.start_time.utc.iso8601,
+            "start_time" => start_time(run_status),
           }
         end
       end

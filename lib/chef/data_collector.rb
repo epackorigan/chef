@@ -18,38 +18,43 @@
 # limitations under the License.
 #
 
-require "uri"
 require "chef/server_api"
 require "chef/http/simple_json"
 require "chef/event_dispatch/base"
-require "ostruct"
 require "set"
 require "chef/data_collector/node_uuid"
 require "chef/data_collector/run_end_message"
 require "chef/data_collector/run_start_message"
+require "chef/data_collector/config_validation"
 
 class Chef
-
-  # == Chef::DataCollector
-  # Provides methods for determinine whether a reporter should be registered.
   class DataCollector
+
     # == Chef::DataCollector::Reporter
     # Provides an event handler that can be registered to report on Chef
     # run data. Unlike the existing Chef::ResourceReporter event handler,
     # the DataCollector handler is not tied to a Chef Server / Chef Reporting
     # and exports its data through a webhook-like mechanism to a configured
     # endpoint.
+    #
     class Reporter < EventDispatch::Base
 
-      attr_reader :status
-      attr_reader :exception
+      # handle to the expanded_run_list for messages
       attr_reader :expanded_run_list
+
+      # handle to the run_status for messages
       attr_reader :run_status
+
+      # handle to the node object
+      attr_reader :node
+
+      # accumulated list of deprecations
       attr_reader :deprecations
+
+      # handle to the action_collection to gather resources from
       attr_reader :action_collection
 
       # handle to the events object so we can deregister
-      # @api private
       attr_reader :events
 
       def initialize(events)
@@ -58,39 +63,12 @@ class Chef
         @deprecations            = Set.new
       end
 
-      # see EventDispatch::Base#run_started
-      # Upon receipt, we will send our run start message to the
-      # configured DataCollector endpoint. Depending on whether
-      # the user has configured raise_on_failure, if we cannot
-      # send the message, we will either disable the DataCollector
-      # Reporter for the duration of this run, or we'll raise an
-      # exception.
-      def run_started(current_run_status)
-        @run_status = current_run_status
-
-        # publish our node_uuid back to the node data object
-        run_status.run_context.node.automatic[:chef_guid] = Chef::DataCollector::NodeUUID.node_uuid(run_status.run_context.node)
-
-        # do sanity checks
-        validate_data_collector_server_url!
-        validate_data_collector_output_locations!
-
-        # do the run_start_message
-        message = Chef::DataCollector::RunStartMessage.run_start_message(self)
-        send_to_data_collector(message)
-        send_to_output_locations(message)
+      def run_start(chef_version, run_status)
+        @run_status = run_status
       end
 
-      # see EventDispatch::Base#run_completed
-      # Upon receipt, we will send our run completion message to the
-      # configured DataCollector endpoint.
-      def run_completed(node)
-        send_run_completion("success")
-      end
-
-      # see EventDispatch::Base#run_failed
-      def run_failed(exception)
-        send_run_completion("failure")
+      def node_load_success(node)
+        @node = node
       end
 
       def action_collection_registration(action_collection)
@@ -98,17 +76,56 @@ class Chef
         action_collection.register(self) if should_be_enabled?
       end
 
-      # see EventDispatch::Base#run_list_expanded
-      # The expanded run list is stored for later use by the run_completed
-      # event and message.
-      def run_list_expanded(run_list_expansion)
-        @expanded_run_list = run_list_expansion
+      # Upon receipt, we will send our run start message to the
+      # configured DataCollector endpoint. Depending on whether
+      # the user has configured raise_on_failure, if we cannot
+      # send the message, we will either disable the DataCollector
+      # Reporter for the duration of this run, or we'll raise an
+      # exception.
+      #
+      # see EventDispatch::Base#run_started
+      #
+      def run_started(run_status)
+        # publish our node_uuid back to the node data object
+        run_status.node.automatic[:chef_guid] = Chef::DataCollector::NodeUUID.node_uuid(run_status.node)
+
+        # do sanity checks
+        Chef::DataCollector::ConfigValidation.validate_server_url!
+        Chef::DataCollector::ConfigValidation.validate_output_locations!
+
+        send_run_start
       end
 
-      # see EventDispatch::Base#deprecation
       # Append a received deprecation to the list of deprecations
+      #
+      # see EventDispatch::Base#deprecation
+      #
       def deprecation(message, location = caller(2..2)[0])
-        add_deprecation(message.message, message.url, location)
+        @deprecations << { message: message.message, url: message.url, location: message.location }
+      end
+
+      # Upon receipt, we will send our run completion message to the
+      # configured DataCollector endpoint.
+      #
+      # see EventDispatch::Base#run_completed
+      #
+      def run_completed(node)
+        send_run_completion("success")
+      end
+
+      # see EventDispatch::Base#run_failed
+      #
+      def run_failed(exception)
+        send_run_completion("failure")
+      end
+
+      # The expanded run list is stored for later use by the run_completed
+      # event and message.
+      #
+      # see EventDispatch::Base#run_list_expanded
+      #
+      def run_list_expanded(run_list_expansion)
+        @expanded_run_list = run_list_expansion
       end
 
       private
@@ -127,10 +144,8 @@ class Chef
       def http_output_locations
         @http_output_locations ||=
           begin
-            if Chef::Config[:data_collector][:output_locations]
-              Chef::Config[:data_collector][:output_locations][:urls].each_with_object({}) do |location_url, http_output_locations|
-                http_output_locations[location_url] = setup_http_client(location_url)
-              end
+            Chef::Config[:data_collector][:output_locations][:urls].each_with_object({}) do |location_url, http_output_locations|
+              http_output_locations[location_url] = setup_http_client(location_url)
             end
           end
       end
@@ -143,17 +158,8 @@ class Chef
         end
       end
 
-      #
-      # Yields to the passed-in block (which is expected to be some interaction
-      # with the DataCollector endpoint). If some communication failure occurs,
-      # either disable any future communications to the DataCollector endpoint, or
-      # raise an exception (if the user has set
-      # Chef::Config.data_collector.raise_on_failure to true.)
-      #
-      # @param block [Proc] A ruby block to run. Ignored if a command is given.
-      #
-      def disable_reporter_on_error
-        yield
+      def send_to_data_collector(message)
+        http.post(nil, message, headers) if Chef::Config[:data_collector][:server_url]
       rescue Timeout::Error, Errno::EINVAL, Errno::ECONNRESET,
         Errno::ECONNREFUSED, EOFError, Net::HTTPBadResponse,
         Net::HTTPHeaderSyntaxError, Net::ProtocolError, OpenSSL::SSL::SSLError,
@@ -181,34 +187,39 @@ class Chef
         end
       end
 
-      def send_to_data_collector(message)
-        disable_reporter_on_error do
-          http.post(nil, message, headers) if Chef::Config[:data_collector][:server_url]
-        end
-      end
-
       def send_to_output_locations(message)
         return unless Chef::Config[:data_collector][:output_locations]
 
-        Chef::Config[:data_collector][:output_locations].each do |type, location_list|
-          location_list.each do |l|
-            handle_output_location(type, l, message)
+        Chef::Config[:data_collector][:output_locations].each do |type, locations|
+          locations.each do |location|
+            send_to_file_location(location, message) if type == :files
+            send_to_http_location(location, message) if type == :urls
           end
         end
       end
 
-      def handle_output_location(type, loc, message)
-        type == :urls ? send_to_http_location(loc, message) : send_to_file_location(loc, message)
-      end
-
       def send_to_file_location(file_name, message)
-        open(file_name, "a") { |f| f.puts message }
+        File.open(file_name, "a") do |fh|
+          fh.puts Chef::JSONCompat.to_json(message)
+        end
       end
 
       def send_to_http_location(http_url, message)
         @http_output_locations[http_url].post(nil, message, headers) if @http_output_locations[http_url]
       rescue
-        Chef::Log.trace("Data collector failed to send to URL location #{http_url}. Please check your configured data_collector.output_locations")
+        # FIXME: this feels like poor behavior on several different levels, at least its a warn now...
+        Chef::Log.warn("Data collector failed to send to URL location #{http_url}. Please check your configured data_collector.output_locations")
+      end
+
+      def sent_run_start?
+        !!@sent_run_start
+      end
+
+      def send_run_start
+        message = Chef::DataCollector::RunStartMessage.construct_message(self)
+        send_to_data_collector(message)
+        send_to_output_locations(message)
+        @sent_run_start = true
       end
 
       #
@@ -222,10 +233,8 @@ class Chef
       # @param opts [Hash] Additional details about the run, such as its success/failure.
       #
       def send_run_completion(status)
-        # If run_status is nil we probably failed before the client triggered
-        # the run_started callback. In this case we'll skip updating because
-        # we have nothing to report.
-        return unless run_status
+        # this is necessary to send a run_start message when we fail before the run_started chef event
+        send_run_start unless sent_run_start?
 
         message = Chef::DataCollector::RunEndMessage.construct_message(self, status)
         send_to_data_collector(message)
@@ -243,67 +252,6 @@ class Chef
         headers
       end
 
-      def add_deprecation(message, url, location)
-        @deprecations << { message: message, url: url, location: location }
-      end
-
-      ################### VALIDATION FIXME: extract somehow ################################
-
-      def safe_uri(uri)
-        URI(uri)
-      rescue URI::InvalidURIError
-        nil
-      end
-
-      def validate_and_create_file(file)
-        send_to_file_location(file, "")
-        true
-        # Rescue exceptions raised by the file path being non-existent or not writeable and re-raise them to the user
-        # with clearer explanatory text.
-      rescue Errno::ENOENT
-        raise Chef::Exceptions::ConfigurationError,
-          "Chef::Config[:data_collector][:output_locations][:files] contains the location #{file}, which is a non existent file path."
-      rescue Errno::EACCES
-        raise Chef::Exceptions::ConfigurationError,
-          "Chef::Config[:data_collector][:output_locations][:files] contains the location #{file}, which cannnot be written to by Chef."
-      end
-
-      def validate_data_collector_server_url!
-        unless !Chef::Config[:data_collector][:server_url] && Chef::Config[:data_collector][:output_locations]
-          uri = safe_uri(Chef::Config[:data_collector][:server_url])
-          unless uri
-            raise Chef::Exceptions::ConfigurationError, "Chef::Config[:data_collector][:server_url] (#{Chef::Config[:data_collector][:server_url]}) is not a valid URI."
-          end
-
-          if uri.host.nil?
-            raise Chef::Exceptions::ConfigurationError,
-              "Chef::Config[:data_collector][:server_url] (#{Chef::Config[:data_collector][:server_url]}) is a URI with no host. Please supply a valid URL."
-          end
-        end
-      end
-
-      def handle_type(type, loc)
-        type == :urls ? safe_uri(loc) : validate_and_create_file(loc)
-      end
-
-      def validate_data_collector_output_locations!
-        return unless Chef::Config[:data_collector][:output_locations]
-
-        if Chef::Config[:data_collector][:output_locations].empty?
-          raise Chef::Exceptions::ConfigurationError,
-            "Chef::Config[:data_collector][:output_locations] is empty. Please supply an hash of valid URLs and / or local file paths."
-        end
-
-        Chef::Config[:data_collector][:output_locations].each do |type, locations|
-          locations.each do |l|
-            unless handle_type(type, l)
-              raise Chef::Exceptions::ConfigurationError,
-                "Chef::Config[:data_collector][:output_locations] contains the location #{l} which is not valid."
-            end
-          end
-        end
-      end
-
       # Whether or not to enable data collection:
       # * always disabled for why run mode
       # * disabled when the user sets `Chef::Config[:data_collector][:mode]` to a
@@ -312,32 +260,30 @@ class Chef
       # * disabled if `Chef::Config[:data_collector][:server_url]` is set to a
       #   falsey value
       def should_be_enabled?
-        solo = Chef::Config[:solo] || Chef::Config[:local_mode]
-        mode = Chef::Config[:data_collector][:mode]
+        running_mode = Chef::Config[:solo] || Chef::Config[:local_mode] ? :solo : :client
+        want_mode = Chef::Config[:data_collector][:mode]
 
-        if Chef::Config[:why_run]
+        case
+        when Chef::Config[:why_run]
           Chef::Log.trace("data collector is disabled for why run mode")
-          return false
-        end
-        unless mode == :both || solo && mode == :solo || !solo && mode == :client
-          Chef::Log.trace("data collector is configured to only run in " \
-                          "#{Chef::Config[:data_collector][:mode].inspect} modes, disabling it")
-          return false
-        end
-        unless Chef::Config[:data_collector][:server_url] || Chef::Config[:data_collector][:output_locations]
+          false
+        when (want_mode != :both) && running_mode != want_mode
+          Chef::Log.trace("data collector is configured to only run in #{Chef::Config[:data_collector][:mode]} modes, disabling it")
+          false
+        when !(Chef::Config[:data_collector][:server_url] || Chef::Config[:data_collector][:output_locations])
           Chef::Log.trace("Neither data collector URL or output locations have been configured, disabling data collector")
-          return false
-        end
-        if solo && !Chef::Config[:data_collector][:token]
+          false
+        when running_mode == :solo && !Chef::Config[:data_collector][:token]
           Chef::Log.trace("Data collector token must be configured to use Chef Automate data collector with Chef Solo")
-          return false
-        end
-        if !solo && Chef::Config[:data_collector][:token]
-          Chef::Log.warn("Data collector token authentication is not recommended for client-server mode" \
+          false
+        when running_mode == :client && Chef::Config[:data_collector][:token]
+          Chef::Log.warn("Data collector token authentication is not recommended for client-server mode. " \
                          "Please upgrade Chef Server to 12.11.0 and remove the token from your config file " \
                          "to use key based authentication instead")
+          true
+        else
+          true
         end
-        true
       end
 
     end

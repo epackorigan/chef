@@ -34,37 +34,39 @@ class Chef
         #
         def construct_message(data_collector, status)
           action_collection = data_collector.action_collection
+          run_status = data_collector.run_status
+          node = data_collector.node
 
           message = {
             "chef_server_fqdn" => chef_server_fqdn,
-            "entity_uuid" => Chef::DataCollector::NodeUUID.node_uuid(data_collector.run_status.node),
+            "entity_uuid" => Chef::DataCollector::NodeUUID.node_uuid(node),
             "expanded_run_list" => data_collector.expanded_run_list,
-            "id" => data_collector.run_status.run_id,
+            "id" => run_status&.run_id,
             "message_version" => "1.1.0",
             "message_type" => "run_converge",
-            "node" => data_collector.run_status.node,
-            "node_name" => data_collector.run_status.node.name,
+            "node" => node,
+            "node_name" => node&.name,
             "organization_name" => organization,
             "resources" => all_resource_reports(action_collection),
-            "run_id" => data_collector.run_status.run_id,
-            "run_list" => data_collector.run_status.node.run_list.for_json,
-            "policy_name" => data_collector.run_status.node.policy_name,
-            "policy_group" => data_collector.run_status.node.policy_group,
-            "start_time" => data_collector.run_status.start_time.utc.iso8601,
-            "end_time" => data_collector.run_status.end_time.utc.iso8601,
+            "run_id" => run_status&.run_id,
+            "run_list" => node&.run_list&.for_json,
+            "policy_name" => node&.policy_name,
+            "policy_group" => node&.policy_group,
+            "start_time" => start_time(run_status),
+            "end_time" => end_time(run_status),
             "source" => collector_source,
             "status" => status,
             "total_resource_count" => all_resource_reports(action_collection).count,
             "updated_resource_count" => updated_resource_count(action_collection),
-            "deprecations" => data_collector.deprecations,
+            "deprecations" => data_collector.deprecations.to_a,
           }
 
-          if data_collector.run_status.exception
+          if run_status&.exception
             message["error"] = {
-              "class" => data_collector.run_status.exception.class,
-              "message" => data_collector.run_status.exception.message,
-              "backtrace" => data_collector.run_status.exception.backtrace,
-              "description" => data_collector.action_collection.error_descriptions,
+              "class" => run_status.exception.class,
+              "message" => run_status.exception.message,
+              "backtrace" => run_status.exception.backtrace,
+              "description" => data_collector.action_collection&.error_descriptions,
             }
           end
 
@@ -75,12 +77,14 @@ class Chef
 
         # strip out everything other than top-level updated resources and count them
         def updated_resource_count(action_collection)
-          action_collection.filtered_collection(max_nesting: 0, up_to_date: false, skipped: false, unprocessed: false, failed: false).size
+          return 0 if action_collection.nil?
+          action_collection.filtered_collection(up_to_date: false, skipped: false, unprocessed: false, failed: false).size
         end
 
         # get only the top level resources and strip out the subcollections
         def action_records(action_collection)
-          action_collection.filtered_collection(max_nesting: 0)
+          return [] if action_collection.nil?
+          action_collection.updated_resources
         end
 
         def all_resource_reports(action_collection)

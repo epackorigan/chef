@@ -62,7 +62,7 @@ describe Chef::DataCollector do
 
   let(:exception) { nil }
 
-  let(:action_collection) { Chef::ActionCollection.new }
+  let(:action_collection) { Chef::ActionCollection.new(events) }
 
   before do
     allow(Chef::HTTP::SimpleJSON).to receive(:new).and_return(rest_client)
@@ -72,9 +72,12 @@ describe Chef::DataCollector do
     new_resource.recipe_name = recipe_name
     allow(new_resource).to receive(:cookbook_version).and_return(cookbook_version)
     run_list << "recipe[lobster]" << "role[rage]" << "recipe[fist]"
-    allow(Time).to receive(:now).and_return(start_time, end_time)
-    events.register(action_collection)
     events.register(data_collector)
+    events.register(action_collection)
+    events.run_start(Chef::VERSION, run_status)
+    # we're guaranteed that those events are processed or else the data collector has no hope
+    # all other events could see the chef-client crash before executing them and the data collector
+    # still needs to work in those cases, so must come later, and the failure cases must be tested.
   end
 
   def expect_start_message
@@ -90,7 +93,7 @@ describe Chef::DataCollector do
         "organization_name" => "unknown_organization",
         "run_id" => run_status.run_id,
         "source" => "chef_client",
-        "start_time" => run_status&.start_time&.utc&.iso8601,
+        "start_time" => start_time.utc.iso8601,
       },
       { "Content-Type" => "application/json" }
     )
@@ -128,182 +131,179 @@ describe Chef::DataCollector do
     }
   end
 
-  describe "when the start of the run fails" do
-    let(:exception) { Exception.new("imperial to metric conversion error") }
+  def send_run_failed_or_completed_event
+    status == "success" ? events.run_completed(node) : events.run_failed(exception, run_status)
+  end
 
-    it "should report failure when the run list expansion fails" do
-      # this never starts the clock or calls run_started
-      raise "FIXME"
-  #    expect_start_message
-  #    expect_converge_message("chef_server_fqdn"=>"localhost")
-      # events.run_list_expand_failed(node, exception)
-      # events.run_failed(exception, run_status)
+  shared_examples_for "sends a converge message" do
+    it "has a chef_server_fqdn" do
+      expect_converge_message("chef_server_fqdn" => "localhost") # FIXME?
+      send_run_failed_or_completed_event
     end
 
+    it "has a start_time" do
+      expect_converge_message("start_time" => start_time.utc.iso8601)
+      send_run_failed_or_completed_event
+    end
+
+    it "has a end_time" do
+      expect_converge_message("end_time" => end_time.utc.iso8601)
+      send_run_failed_or_completed_event
+    end
+
+    it "has a entity_uuid" do
+      expect_converge_message("entity_uuid" => "779196c6-f94f-4501-9dae-af8081ab4d3a") # FIXME
+      send_run_failed_or_completed_event
+    end
+
+    it "has a expanded_run_list" do
+      expect_converge_message("expanded_run_list" => expansion)
+      send_run_failed_or_completed_event
+    end
+
+    it "has a node" do
+      expect_converge_message("node" => node)
+      send_run_failed_or_completed_event
+    end
+
+    it "has a node_name" do
+      expect_converge_message("node_name" => "spitfire")
+      send_run_failed_or_completed_event
+    end
+
+    it "has an organization" do
+      expect_converge_message("organization_name" => "unknown_organization") # FIXME?
+      send_run_failed_or_completed_event
+    end
+
+    it "has a policy_group" do
+      expect_converge_message("policy_group" => nil) # FIXME?
+      send_run_failed_or_completed_event
+    end
+
+    it "has a policy_name" do
+      expect_converge_message("policy_name" => nil) # FIXME?
+      send_run_failed_or_completed_event
+    end
+
+    it "has a run_id" do
+      expect_converge_message("run_id" => nil) # FIXME
+      send_run_failed_or_completed_event
+    end
+
+    it "has a run_list" do
+      expect_converge_message("run_list" => []) # FIXME
+      send_run_failed_or_completed_event
+    end
+
+    it "has a source" do
+      expect_converge_message("source" => "chef_client") # FIXME
+      send_run_failed_or_completed_event
+    end
+
+    it "has a status" do
+      expect_converge_message("status" => status)
+      send_run_failed_or_completed_event
+    end
+
+    it "has no deprecations" do # FIXME
+      expect_converge_message("deprecations" => [])
+      send_run_failed_or_completed_event
+    end
+
+    it "has an error field" do
+      if exception
+        expect_converge_message(
+          "error" => {
+            "class" => exception.class,
+            "message" => exception.message,
+            "backtrace" => exception.backtrace,
+            "description" => error_description,
+          }
+        )
+      else
+        expect(rest_client).to receive(:post).with(
+          nil,
+          hash_excluding("error"),
+          { "Content-Type" => "application/json" }
+        )
+      end
+      send_run_failed_or_completed_event
+    end
+
+    it "has a total resource count of zero" do
+      expect_converge_message("total_resource_count" => total_resource_count)
+      send_run_failed_or_completed_event
+    end
+
+    it "has a updated resource count of zero" do
+      expect_converge_message("updated_resource_count" => updated_resource_count)
+      send_run_failed_or_completed_event
+    end
+
+    it "includes the resource record" do
+      expect_converge_message("resources" => resource_record)
+      send_run_failed_or_completed_event
+    end
+  end
+
+  describe "when the run fails before the node loads" do
+    let(:exception) { Exception.new("imperial to metric conversion error") }
+    let(:error_description) { Chef::Formatters::ErrorMapper.cookbook_resolution_failed(expansion, exception).for_json }
+    let(:total_resource_count) { 0 }
+    let(:updated_resource_count) { 0 }
+    let(:status) { "failure" }
+    let(:node_name) { nil } # FIXME?
+
+    before do
+      # funky but for $REASONS we call Time.now three times for early errors (start+end are not perfectly accurate)
+      allow(Time).to receive(:now).and_return(start_time, start_time, end_time)
+      expect_start_message
+    end
+
+    it_behaves_like "sends a converge message"
+  end
+
+  describe "when the run fails after the node loads, during run_list_expansion" do
+    let(:exception) { Exception.new("imperial to metric conversion error") }
+    let(:error_description) { Chef::Formatters::ErrorMapper.cookbook_resolution_failed(expansion, exception).for_json }
+    let(:total_resource_count) { 0 }
+    let(:updated_resource_count) { 0 }
+    let(:status) { "failure" }
+
+    before do
+      # funky but for $REASONS we call Time.now three times for early errors (start+end are not perfectly accurate)
+      allow(Time).to receive(:now).and_return(start_time, start_time, end_time)
+      events.node_load_success(node)
+      run_status.node = node
+      expect_start_message
+    end
+
+    it_behaves_like "sends a converge message"
   end
 
   describe "after successfully starting the run" do
     before do
+      allow(Time).to receive(:now).and_return(start_time, end_time)
+      # these events happen in this order in the client
+      events.node_load_success(node)
+      run_status.node = node
       events.run_list_expanded(expansion)
       run_status.start_clock
-      events.cookbook_compilation_start(run_context)
-    end
-
-    describe "initialization" do
-      it "the default :server_url is based on the :chef_server_url" do
-        # i had no idea there was a default :chef_server_url
-        expect(Chef::Config[:chef_server_url]).to eql("https://localhost:443")
-        expect(Chef::Config[:data_collector][:server_url]).to eql("https://localhost:443/data-collector")
-      end
-
-      it "the default :output_locations is nil" do
-        expect(Chef::Config[:data_collector][:output_locations]).to be nil
-      end
     end
 
     describe "run_start_message" do
       it "does it" do
-        run_status.run_context = run_context
         expect_start_message
-        events.run_started(run_status)
-      end
-
-      it "if there is no server_url or output_location it does not send a message" do
-        Chef::Config[:data_collector][:server_url] = nil
-        Chef::Config[:data_collector][:output_locations] = nil
-        expect(rest_client).not_to receive(:post)
-        events.run_started(run_status)
-      end
-
-      it "in why-run mode it does not send a message" do
-        Chef::Config[:why_run] = true
-        expect(rest_client).not_to receive(:post)
         events.run_started(run_status)
       end
     end
 
     describe "converge messages" do
       before do
-        run_status.run_context = run_context
         expect_start_message
         events.run_started(run_status)
-        events.converge_start(run_context)
-      end
-
-      def send_run_failed_or_completed_event
-        status == "success" ? events.run_completed(node) : events.run_failed(exception, run_status)
-      end
-
-      shared_examples_for "sends a converge message" do
-        it "has a chef_server_fqdn" do
-          expect_converge_message("chef_server_fqdn" => "localhost") # FIXME?
-          send_run_failed_or_completed_event
-        end
-
-        it "has a start_time" do
-          expect_converge_message("start_time" => run_status.start_time.utc.iso8601)
-          send_run_failed_or_completed_event
-        end
-
-        it "has a end_time" do
-          expect_converge_message("end_time" => run_status.end_time.utc.iso8601)
-          send_run_failed_or_completed_event
-        end
-
-        it "has a entity_uuid" do
-          expect_converge_message("entity_uuid" => "779196c6-f94f-4501-9dae-af8081ab4d3a") # FIXME
-          send_run_failed_or_completed_event
-        end
-
-        it "has a expanded_run_list" do
-          expect_converge_message("expanded_run_list" => expansion)
-          send_run_failed_or_completed_event
-        end
-
-        it "has a node" do
-          expect_converge_message("node" => node)
-          send_run_failed_or_completed_event
-        end
-
-        it "has a node_name" do
-          expect_converge_message("node_name" => "spitfire")
-          send_run_failed_or_completed_event
-        end
-
-        it "has an organization" do
-          expect_converge_message("organization_name" => "unknown_organization") # FIXME?
-          send_run_failed_or_completed_event
-        end
-
-        it "has a policy_group" do
-          expect_converge_message("policy_group" => nil) # FIXME?
-          send_run_failed_or_completed_event
-        end
-
-        it "has a policy_name" do
-          expect_converge_message("policy_name" => nil) # FIXME?
-          send_run_failed_or_completed_event
-        end
-
-        it "has a run_id" do
-          expect_converge_message("run_id" => nil) # FIXME
-          send_run_failed_or_completed_event
-        end
-
-        it "has a run_list" do
-          expect_converge_message("run_list" => []) # FIXME
-          send_run_failed_or_completed_event
-        end
-
-        it "has a source" do
-          expect_converge_message("source" => "chef_client") # FIXME
-          send_run_failed_or_completed_event
-        end
-
-        it "has a status" do
-          expect_converge_message("status" => status)
-          send_run_failed_or_completed_event
-        end
-
-        it "has no deprecations" do # FIXME
-          expect_converge_message("deprecations" => [])
-          send_run_failed_or_completed_event
-        end
-
-        it "has an error field" do
-          if exception
-            expect_converge_message(
-              "error" => {
-                "class" => exception.class,
-                "message" => exception.message,
-                "backtrace" => exception.backtrace,
-                "description" => error_description,
-              }
-            )
-          else
-            expect(rest_client).to receive(:post).with(
-              nil,
-              hash_excluding("error"),
-              { "Content-Type" => "application/json" }
-            )
-          end
-          send_run_failed_or_completed_event
-        end
-
-        it "has a total resource count of zero" do
-          expect_converge_message("total_resource_count" => total_resource_count)
-          send_run_failed_or_completed_event
-        end
-
-        it "has a updated resource count of zero" do
-          expect_converge_message("updated_resource_count" => updated_resource_count)
-          send_run_failed_or_completed_event
-        end
-
-        it "includes the resource record" do
-          expect_converge_message("resources" => resource_record)
-          send_run_failed_or_completed_event
-        end
+        events.cookbook_compilation_start(run_context)
       end
 
       context "when the run contains a file resource that is up-to-date" do
@@ -342,17 +342,23 @@ describe Chef::DataCollector do
         it_behaves_like "sends a converge message"
       end
 
-      context "When there is an embedded resource, it omits reporting the sub-resource" do
-        let(:total_resource_count) { 1 }
-        let(:updated_resource_count) { 1 }
-        let(:resource_record) { [ resource_record_for(current_resource, new_resource, :create, "updated") ] }
+      context "When there is an embedded resource, it includes the sub-resource in the report" do
+        let(:total_resource_count) { 2 }
+        let(:updated_resource_count) { 2 }
+        let(:implementation_resource) do
+          r = Chef::Resource::CookbookFile.new("/preseed-file.txt")
+          r.cookbook_name = cookbook_name
+          r.recipe_name = recipe_name
+          allow(r).to receive(:cookbook_version).and_return(cookbook_version)
+          r
+        end
+        let(:resource_record) { [ resource_record_for(implementation_resource, implementation_resource, :create, "updated"), resource_record_for(current_resource, new_resource, :create, "updated") ] }
         let(:status) { "success" }
 
         before do
           events.resource_action_start(new_resource, :create)
           events.resource_current_state_loaded(new_resource, :create, current_resource)
 
-          implementation_resource = Chef::Resource::CookbookFile.new("/preseed-file.txt")
           events.resource_action_start(implementation_resource , :create)
           events.resource_current_state_loaded(implementation_resource, :create, implementation_resource)
           events.resource_updated(implementation_resource, :create)

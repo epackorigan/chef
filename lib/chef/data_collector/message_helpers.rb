@@ -94,6 +94,16 @@ class Chef
       def solo_run?
         Chef::Config[:solo] || Chef::Config[:local_mode]
       end
+
+      def start_time(run_status)
+        t = run_status&.start_time || Time.now
+        t.utc.iso8601
+      end
+
+      def end_time(run_status)
+        t = run_status&.end_time || Time.now
+        t.utc.iso8601
+      end
     end
   end
 end

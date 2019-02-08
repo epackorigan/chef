@@ -86,8 +86,9 @@ class Chef
     attr_reader :run_status
     attr_reader :run_context
     attr_reader :consumers
+    attr_reader :events
 
-    def initialize
+    def initialize(events)
       @updated_resources  = []
       @total_res_count    = 0
       @status             = "success"
@@ -95,6 +96,7 @@ class Chef
       @expanded_run_list  = {}
       @pending_updates    = []
       @consumers          = []
+      @events             = events
     end
 
     def each(&block)
@@ -103,9 +105,9 @@ class Chef
 
     # allows getting at the updated_resources collection filtered by nesting level and status
     #
-    def filtered_collection(max_nesting: 0, up_to_date: true, skipped: true, updated: true, failed: true, unprocessed: true)
+    def filtered_collection(max_nesting: nil, up_to_date: true, skipped: true, updated: true, failed: true, unprocessed: true)
       updated_resources.select do |rec|
-        rec.nesting_level <= max_nesting &&
+        ( max_nesting.nil? || rec.nesting_level <= max_nesting ) &&
           ( rec.status == :up_to_date && up_to_date ||
             rec.status == :skipped && skipped ||
             rec.status == :updated && updated ||
@@ -120,7 +122,7 @@ class Chef
 
     def cookbook_compilation_start(run_context)
       run_context.action_collection = self
-      # we fire the action_collection_registration event during the converge_start hook -- the magic of stack
+      # we fire the action_collection_registration event during the cookbook_compilation_start hook -- the magic of stack
       # frames means this should just work.  but maybe we need a way to schedule an event on the dispatcher to run
       # after the current one has completed?
       run_context.events.enqueue(:action_collection_registration, self)
